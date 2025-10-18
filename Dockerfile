@@ -1,23 +1,13 @@
-FROM docker.io/golang:1.24.4 AS trivy_builder
+FROM docker.io/jlesage/baseimage-gui:ubuntu-24.04-v4
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
-RUN set -x && \
-    git clone --depth=1 https://github.com/aquasecurity/trivy /src/trivy && \
-    pushd /src/trivy/cmd/trivy && \
-    go build
-
-FROM docker.io/jlesage/baseimage-gui:ubuntu-22.04-v4
-
-ENV CHROMIUM_FLAGS="--no-sandbox" \
-    URL_PICARD_REPO="https://github.com/metabrainz/picard.git" \
+ENV URL_PICARD_REPO="https://github.com/metabrainz/picard.git" \
     URL_CHROMAPRINT_REPO="https://github.com/acoustid/chromaprint.git" \
     URL_GOOGLETEST_REPO="https://github.com/google/googletest.git"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 COPY rootfs/ /
-COPY --from=trivy_builder /src/trivy/cmd/trivy/trivy /src/trivy
+COPY --from=ghcr.io/aquasecurity/trivy:latest /usr/local/bin/trivy /usr/local/bin/trivy
 
 RUN set -x && \
     # Define package arrays
@@ -25,15 +15,9 @@ RUN set -x && \
     # KEPT_PACKAGES will remain in the image
     TEMP_PACKAGES=() && \
     KEPT_PACKAGES=() && \
-    # Install software-properties-common so we can use add-apt-repository
-    TEMP_PACKAGES+=(software-properties-common) && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-      ${KEPT_PACKAGES[@]} \
-      ${TEMP_PACKAGES[@]} \
-      && \
     TEMP_PACKAGES+=(gnupg) && \
     # Install pip to allow install of Picard dependencies
+    TEMP_PACKAGES+=(python3-venv) && \
     TEMP_PACKAGES+=(python3-pip) && \
     TEMP_PACKAGES+=(python3-setuptools) && \
     TEMP_PACKAGES+=(python3-wheel) && \
@@ -49,13 +33,14 @@ RUN set -x && \
     # Install Chromaprint dependencies
     KEPT_PACKAGES+=(ffmpeg) && \
     TEMP_PACKAGES+=(libswresample-dev) && \
-    KEPT_PACKAGES+=(libswresample3) && \
+    KEPT_PACKAGES+=(libswresample4) && \
     TEMP_PACKAGES+=(libfftw3-dev) && \
-    KEPT_PACKAGES+=(libfftw3-3) && \
+    KEPT_PACKAGES+=(libfftw3-single3) && \
+    KEPT_PACKAGES+=(libfftw3-double3) && \
     TEMP_PACKAGES+=(libavcodec-dev) && \
-    KEPT_PACKAGES+=(libavcodec58) && \
+    KEPT_PACKAGES+=(libavcodec60) && \
     TEMP_PACKAGES+=(libavformat-dev) && \
-    KEPT_PACKAGES+=(libavformat58) && \
+    KEPT_PACKAGES+=(libavformat60) && \
     # Install Picard dependencies
     TEMP_PACKAGES+=(python3-dev) && \
     KEPT_PACKAGES+=(python3-six) && \
@@ -120,8 +105,6 @@ RUN set -x && \
       ${KEPT_PACKAGES[@]} \
       ${TEMP_PACKAGES[@]} \
       && \
-    # Update ca certs
-    update-ca-certificates -f && \
     # Build & install OpenSSL v1.1.1
     wget \
       -O /tmp/openssl-1.1.1w.tar.gz \
@@ -136,8 +119,8 @@ RUN set -x && \
       && \
     pushd /src/openssl/openssl-* && \
     ./config && \
-    make test && \
-    make && \
+    make -j$(nproc) test && \
+    make -j$(nproc) && \
     make install && \
     popd && \
     ldconfig && \
@@ -153,9 +136,7 @@ RUN set -x && \
     # Clone Chromaprint repo & checkout latest version
     git clone "$URL_CHROMAPRINT_REPO" /src/chromaprint && \
     pushd /src/chromaprint && \
-    # Pin chromaprint version to v1.4.3 due to https://github.com/acoustid/chromaprint/issues/107
-    # BRANCH_CHROMAPRINT=$(git tag --sort="-creatordate" | head -1) && \
-    BRANCH_CHROMAPRINT="v1.4.3" && \
+    BRANCH_CHROMAPRINT="v1.6.0" && \
     git checkout "tags/${BRANCH_CHROMAPRINT}" && \
     cmake \
       -DCMAKE_BUILD_TYPE=Release \
@@ -164,32 +145,31 @@ RUN set -x && \
       -DGTEST_SOURCE_DIR=/src/googletest/googletest \
       -DGTEST_INCLUDE_DIR=/src/googletest/googletest/include . \
       && \
-    make && \
-    make check && \
+    make -j$(nproc) && \
     make install && \
     echo "chromaprint $BRANCH_CHROMAPRINT" >> /VERSIONS && \
     popd && \
     ldconfig && \
-    # Install chromium browser - https://askubuntu.com/questions/1204571/how-to-install-chromium-without-snap
-    bash -c " echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/debian-buster.gpg] http://deb.debian.org/debian buster main' > /etc/apt/sources.list.d/debian.list" && \
-    bash -c " echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/debian-buster-updates.gpg] http://deb.debian.org/debian buster-updates main' >> /etc/apt/sources.list.d/debian.list" && \
-    bash -c " echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/debian-security-buster.gpg] http://deb.debian.org/debian-security buster/updates main' >> /etc/apt/sources.list.d/debian.list" && \
-    apt-key adv --keyserver keyserver.ubuntu.com --recv-keys DCC9EFBF77E11517 && \
-    apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 648ACFD622F3D138 && \
-    apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 112695A0E562B32A && \
-    bash -c "apt-key export 77E11517 | gpg --dearmour -o /usr/share/keyrings/debian-buster.gpg" && \
-    bash -c "apt-key export 22F3D138 | gpg --dearmour -o /usr/share/keyrings/debian-buster-updates.gpg" && \
-    bash -c "apt-key export E562B32A | gpg --dearmour -o /usr/share/keyrings/debian-security-buster.gpg" && \
-    apt-get update && \
-    apt-get install --no-install-recommends -y chromium && \
+    # Use firefox from upstream to avoid snap
+    install -d -m 0755 /etc/apt/keyrings && \
+    wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O- | tee /etc/apt/keyrings/packages.mozilla.org.asc > /dev/null && \
+    echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" | tee -a /etc/apt/sources.list.d/mozilla.list > /dev/null && \
+    echo '\
+    Package: *\
+    Pin: origin packages.mozilla.org\
+    Pin-Priority: 1000\
+    ' | tee /etc/apt/preferences.d/mozilla && \
+    apt-get update -qq && \
+    apt-get install --no-install-recommends -y firefox && \
     # Clone Picard repo & checkout latest version
-    git clone "$URL_PICARD_REPO" /src/picard && \
-    pushd /src/picard && \
+    git clone "$URL_PICARD_REPO" /app/picard && \
+    pushd /app/picard && \
     BRANCH_PICARD=$(git tag --sort="-creatordate" | head -1) && \
     git checkout "tags/${BRANCH_PICARD}" && \
     # Install Picard requirements
-    python3 -m pip install --no-cache-dir --upgrade pip && \
-    python3 -m pip install --no-cache-dir discid python-libdiscid && \
+    python3 -m venv /app/picard/.venv && \
+    . /app/picard/.venv/bin/activate && \
+    python3 -m pip install --no-cache-dir setuptools discid python-libdiscid && \
     python3 -m pip install --no-cache-dir -r requirements.txt && \
     locale-gen en_US.UTF-8 && \
     export LC_ALL=C.UTF-8 && \
@@ -211,7 +191,7 @@ RUN set -x && \
       && \
     chmod +x /etc/cont-init.d/54-check-optical-drive.sh && \
     # Security updates / fix for issue #37 (https://github.com/mikenye/docker-picard/issues/37)    
-    /src/trivy --cache-dir /tmp/trivy fs --vuln-type os -f json --ignore-unfixed --no-progress -o /tmp/trivy.out / && \
+    trivy --cache-dir /tmp/trivy fs --vuln-type os -f json --ignore-unfixed --no-progress -o /tmp/trivy.out / && \
     apt-get install -y --no-install-recommends $(jq .[].Vulnerabilities < /tmp/trivy.out | grep '"PkgName":' | tr -s ' ' | cut -d ':' -f 2 | tr -d ' ",' | uniq) && \
     # Install streaming_extractor_music
     wget \
@@ -265,7 +245,8 @@ RUN set -x && \
     fc-cache && \
     # Capture picard version
     mkdir -p /tmp/run/user/app && \
-    bash -c "picard -V | grep Picard | cut -d ',' -f 1 | cut -d ' ' -f 2 | tr -d ' ' > /CONTAINER_VERSION"
+    ln -s /app/picard/.venv/bin/picard /usr/local/bin/picard && \
+    bash -o pipefail -c "picard -V | grep Picard | cut -d ',' -f 1 | cut -d ' ' -f 2 | tr -d ' ' > /CONTAINER_VERSION"
 
 ENV APP_NAME="MusicBrainz Picard" \
     LC_ALL="en_US.UTF-8" \
